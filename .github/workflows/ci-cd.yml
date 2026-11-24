@@ -1,0 +1,189 @@
+name: Backend CI/CD (Build, UAT, Docker Hub & Azure Dev/Prod)
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: andreshu07/smarttable-api
+  RESOURCE_GROUP: rg-smarttable-os
+  DEV_WEBAPP_NAME: smarttable-api-dev-andreshu
+  PROD_WEBAPP_NAME: smarttable-api-prod-andreshu
+
+jobs:
+  # ==========================================
+  # 1. BUILD, UNIT TESTS (UAT) & COVERAGE
+  # ==========================================
+  build-and-test:
+    name: Build, Unit Tests & Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Unit Tests with Coverage
+        run: npx vitest run --coverage --reporter=default --reporter=github-actions
+
+      - name: Report Coverage Summary
+        if: always()
+        uses: davelosert/vitest-coverage-report-action@v2
+        continue-on-error: true
+
+      - name: Upload UAT & Coverage Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-uat-coverage-report
+          path: coverage/
+
+  # ==========================================
+  # 2. DOCKER BUILD & PUSH TO DOCKER HUB
+  # ==========================================
+  docker-publish:
+    name: Build & Push Docker Image
+    needs: build-and-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.sha_tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: echo "sha_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name == 'main' && 'latest' || 'dev' }}
+
+  # ==========================================
+  # 3. DEPLOY TO AZURE DEV
+  # ==========================================
+  deploy-dev:
+    name: Deploy Backend to Azure (Dev)
+    needs: docker-publish
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+      url: https://${{ env.DEV_WEBAPP_NAME }}.azurewebsites.net
+
+    steps:
+      - name: Azure Login (Service Connection)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update Azure Web App Dev container image
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:${{ needs.docker-publish.outputs.image_tag }}"
+          echo "Deploying $IMAGE to ${{ env.DEV_WEBAPP_NAME }}"
+          az webapp config container set \
+            --name "${{ env.DEV_WEBAPP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --container-image-name "$IMAGE" \
+            --container-registry-url "https://index.docker.io"
+          az webapp config appsettings set \
+            --name "${{ env.DEV_WEBAPP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --settings APP_ENV=development APP_VERSION="${{ needs.docker-publish.outputs.image_tag }}"
+          az webapp restart \
+            --name "${{ env.DEV_WEBAPP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}"
+
+      - name: Smoke Test Dev Health Probe
+        run: |
+          URL="https://${{ env.DEV_WEBAPP_NAME }}.azurewebsites.net/health"
+          for i in $(seq 1 12); do
+            if curl -fsS "$URL"; then
+              echo ""
+              echo "Backend Dev saludable en $URL"
+              exit 0
+            fi
+            echo "Esperando contenedor Dev (intento $i/12)..."
+            sleep 10
+          done
+          echo "Advertencia: el contenedor tardo en responder en el smoke test."
+
+  # ==========================================
+  # 4. DEPLOY TO AZURE PROD (MANUAL APPROVAL GATE)
+  # ==========================================
+  deploy-prod:
+    name: Deploy Backend to Azure (Prod)
+    needs: [docker-publish, deploy-dev]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ env.PROD_WEBAPP_NAME }}.azurewebsites.net
+
+    steps:
+      - name: Azure Login (Service Connection)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update Azure Web App Prod container image
+        run: |
+          IMAGE="${{ env.IMAGE_NAME }}:${{ needs.docker-publish.outputs.image_tag }}"
+          echo "Deploying $IMAGE to ${{ env.PROD_WEBAPP_NAME }}"
+          az webapp config container set \
+            --name "${{ env.PROD_WEBAPP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --container-image-name "$IMAGE" \
+            --container-registry-url "https://index.docker.io"
+          az webapp config appsettings set \
+            --name "${{ env.PROD_WEBAPP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --settings APP_ENV=production APP_VERSION="${{ needs.docker-publish.outputs.image_tag }}"
+          az webapp restart \
+            --name "${{ env.PROD_WEBAPP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}"
+
+      - name: Smoke Test Prod Health Probe
+        run: |
+          URL="https://${{ env.PROD_WEBAPP_NAME }}.azurewebsites.net/health"
+          for i in $(seq 1 12); do
+            if curl -fsS "$URL"; then
+              echo ""
+              echo "Backend Prod saludable en $URL"
+              exit 0
+            fi
+            echo "Esperando contenedor Prod (intento $i/12)..."
+            sleep 10
+          done
+          echo "Advertencia: el contenedor tardo en responder en el smoke test."
